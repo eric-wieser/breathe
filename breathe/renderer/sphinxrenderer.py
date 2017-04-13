@@ -8,12 +8,46 @@ import six
 import textwrap
 
 
+class DoxyCPPClassObject(cpp.CPPClassObject):
+    __bases = []
+
+    def parse_definition(self, parser):
+        # add the base classes
+        ast = parser.parse_declaration("class")
+
+        bases = []
+
+        for base in self.__bases:
+            namestr = base.content_[0].value
+
+            # build a name object
+            # TODO: work out if we can use base.refid in a pending_xref somewhere
+            try:
+                parser = cpp.DefinitionParser(namestr, self, self.env.config)
+            except TypeError:
+                # sphinx < 1.5
+                parser = cpp.DefinitionParser(namestr, self)
+            name = parser._parse_nested_name()
+            parser.assert_end()
+
+            bases.append(
+                cpp.ASTBaseClass(name, base.prot, base.virt == 'virtual', False)
+            )
+
+        ast.declaration.bases = bases
+
+        return ast
+
+    def augment(self, bases):
+        self.__bases = bases or []
+
+
 class DomainDirectiveFactory(object):
     # A mapping from node kinds to cpp domain classes and directive names.
     cpp_classes = {
-        'class': (cpp.CPPClassObject, 'class'),
-        'struct': (cpp.CPPClassObject, 'class'),
-        'interface': (cpp.CPPClassObject, 'interface'),
+        'class': (DoxyCPPClassObject, 'class'),
+        'struct': (DoxyCPPClassObject, 'class'),
+        'interface': (DoxyCPPClassObject, 'interface'),
         'function': (cpp.CPPFunctionObject, 'function'),
         'friend': (cpp.CPPFunctionObject, 'function'),
         'slot': (cpp.CPPFunctionObject, 'function'),
@@ -248,7 +282,7 @@ class SphinxRenderer(object):
 
         return '::'.join(names)
 
-    def create_template_node(self, decl):
+    def insert_template_node(self, signature, decl):
         """Creates a node for the ``template <...>`` part of the declaration."""
         if not decl.templateparamlist:
             return None
@@ -256,13 +290,18 @@ class SphinxRenderer(object):
         nodes = [self.node_factory.desc_annotation(template, template), self.node_factory.Text('<')]
         nodes.extend(self.render(decl.templateparamlist))
         nodes.append(self.node_factory.Text(">"))
-        signode = self.node_factory.desc_signature()
-        signode.extend(nodes)
-        return signode
 
-    def run_domain_directive(self, kind, names):
+        signode = type(signature)()
+        signode.extend(nodes)
+
+        signature.parent.insert(0, signode)
+
+    def run_domain_directive(self, kind, names, augment=None):
         domain_directive = DomainDirectiveFactory.create(
             self.context.domain, [kind, names] + self.context.directive_args[2:])
+
+        if hasattr(domain_directive, 'augment') and augment is not None:
+            domain_directive.augment(**augment)
 
         # Translate Breathe's no-link option into the standard noindex option.
         if 'no-link' in self.context.directive_args[2]:
@@ -389,7 +428,13 @@ class SphinxRenderer(object):
         def render_signature(file_data, doxygen_target, name, kind):
             # Defer to domains specific directive.
             self.context.directive_args[1] = [self.get_fully_qualified_name()]
-            nodes = self.run_domain_directive(kind, self.context.directive_args[1])
+
+            if kind in ('class', 'struct'):
+                augment = dict(bases=file_data.compounddef.basecompoundref)
+            else:
+                augment = None
+
+            nodes = self.run_domain_directive(kind, self.context.directive_args[1], augment=augment)
             rst_node = nodes[1]
 
             finder = NodeFinder(rst_node.document)
@@ -400,9 +445,7 @@ class SphinxRenderer(object):
             finder.declarator[0] = self.node_factory.desc_annotation(kind + ' ', kind + ' ')
 
             # Check if there is template information and format it as desired
-            template_signode = self.create_template_node(file_data.compounddef)
-            if template_signode:
-                rst_node.insert(0, template_signode)
+            self.insert_template_node(finder.declarator, file_data.compounddef)
             rst_node.children[0].insert(0, doxygen_target)
             return nodes, finder.content
 
@@ -507,7 +550,6 @@ class SphinxRenderer(object):
                     *intersperse(output, self.node_factory.Text(', '))
                 )
             )
-        render_list(node.basecompoundref, 'Inherits from ')
         render_list(node.derivedcompoundref, 'Subclassed by ')
 
         section_nodelists = {}
@@ -918,9 +960,7 @@ class SphinxRenderer(object):
 
         finder.content.extend(self.description(node))
 
-        template_node = self.create_template_node(node)
-        if template_node:
-            rst_node.insert(0, template_node)
+        self.insert_template_node(finder.declarator, node)
         return nodes
 
     def visit_define(self, node):
